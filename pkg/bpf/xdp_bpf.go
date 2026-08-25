@@ -30,10 +30,11 @@ type xdpStatsValue struct {
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
-	xdpMapAuditRingbuf     = "audit_ringbuf"
-	xdpMapLpmBlocklist     = "lpm_blocklist"
-	xdpMapXdpStatsMap      = "xdp_stats_map"
-	xdpProgXdpFirewallFunc = "xdp_firewall_func"
+	xdpMapAuditRingbuf      = "audit_ringbuf"
+	xdpMapCgroupIdentityMap = "cgroup_identity_map"
+	xdpMapLpmBlocklist      = "lpm_blocklist"
+	xdpMapXdpStatsMap       = "xdp_stats_map"
+	xdpProgXdpFirewallFunc  = "xdp_firewall_func"
 )
 
 // loadXdp returns the embedded CollectionSpec for xdp.
@@ -85,9 +86,10 @@ type xdpProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type xdpMapSpecs struct {
-	AuditRingbuf *ebpf.MapSpec `ebpf:"audit_ringbuf"`
-	LpmBlocklist *ebpf.MapSpec `ebpf:"lpm_blocklist"`
-	XdpStatsMap  *ebpf.MapSpec `ebpf:"xdp_stats_map"`
+	AuditRingbuf      *ebpf.MapSpec `ebpf:"audit_ringbuf"`
+	CgroupIdentityMap *ebpf.MapSpec `ebpf:"cgroup_identity_map"`
+	LpmBlocklist      *ebpf.MapSpec `ebpf:"lpm_blocklist"`
+	XdpStatsMap       *ebpf.MapSpec `ebpf:"xdp_stats_map"`
 }
 
 // xdpVariableSpecs contains global variables before they are loaded into the kernel.
@@ -116,14 +118,16 @@ func (o *xdpObjects) Close() error {
 //
 // It can be passed to loadXdpObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xdpMaps struct {
-	AuditRingbuf *ebpf.Map `ebpf:"audit_ringbuf"`
-	LpmBlocklist *ebpf.Map `ebpf:"lpm_blocklist"`
-	XdpStatsMap  *ebpf.Map `ebpf:"xdp_stats_map"`
+	AuditRingbuf      *ebpf.Map `ebpf:"audit_ringbuf"`
+	CgroupIdentityMap *ebpf.Map `ebpf:"cgroup_identity_map"`
+	LpmBlocklist      *ebpf.Map `ebpf:"lpm_blocklist"`
+	XdpStatsMap       *ebpf.Map `ebpf:"xdp_stats_map"`
 }
 
 func (m *xdpMaps) Close() error {
 	return _XdpClose(
 		m.AuditRingbuf,
+		m.CgroupIdentityMap,
 		m.LpmBlocklist,
 		m.XdpStatsMap,
 	)
