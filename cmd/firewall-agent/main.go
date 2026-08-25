@@ -18,6 +18,7 @@ func main() {
 	iface := flag.String("iface", "veth-s", "Network interface to attach XDP firewall")
 	configPath := flag.String("config", "configs/policy.example.yaml", "Path to YAML policy file")
 	blockCIDR := flag.String("block-cidr", "", "Optional CIDR block rule (e.g. 10.0.0.1/32)")
+	blockCgroup := flag.String("block-cgroup", "", "Optional cgroup path block rule (e.g. /sys/fs/cgroup/test-app-blocked)")
 	flag.Parse()
 
 	log.Printf("[+] Starting eBPF Firewall Agent on interface '%s'...", *iface)
@@ -31,13 +32,24 @@ func main() {
 
 	log.Printf("[+] XDP program successfully attached to interface '%s'.", *iface)
 
-	// Load policies into BPF maps
+	// Load CIDR block rule if specified
 	if *blockCIDR != "" {
 		log.Printf("[+] Adding CIDR block rule: %s (Rule ID: 101)", *blockCIDR)
 		if err := loader.AddBlockCIDR(*blockCIDR, 101); err != nil {
 			log.Fatalf("[!] Failed to add block CIDR: %v", err)
 		}
-	} else if *configPath != "" {
+	}
+
+	// Load Cgroup block rule if specified
+	if *blockCgroup != "" {
+		log.Printf("[+] Adding Cgroup block rule: %s (Rule ID: 103)", *blockCgroup)
+		if err := loader.AddCgroupPathBlock(*blockCgroup, 103); err != nil {
+			log.Printf("[!] Warning: Could not resolve/add cgroup block rule for '%s': %v", *blockCgroup, err)
+		}
+	}
+
+	// Parse policy config file if specified
+	if *configPath != "" && *blockCIDR == "" && *blockCgroup == "" {
 		comp := compiler.NewCompiler()
 		pol, err := comp.ParseFile(*configPath)
 		if err != nil {
@@ -50,6 +62,16 @@ func main() {
 						log.Printf("[+] Adding CIDR block rule: %s (Rule ID: %d)", cidr, rule.ID)
 						if err := loader.AddBlockCIDR(cidr, rule.ID); err != nil {
 							log.Printf("[!] Error adding CIDR %s: %v", cidr, err)
+						}
+					}
+					for _, cg := range rule.SrcCgroups {
+						log.Printf("[+] Adding Cgroup block rule: %s (Rule ID: %d)", cg, rule.ID)
+						if err := loader.AddCgroupPathBlock(cg, rule.ID); err != nil {
+							// Also try full cgroup path under /sys/fs/cgroup
+							fullPath := "/sys/fs/cgroup" + cg
+							if err2 := loader.AddCgroupPathBlock(fullPath, rule.ID); err2 != nil {
+								log.Printf("[!] Error adding Cgroup %s (%v / %v)", cg, err, err2)
+							}
 						}
 					}
 				}
