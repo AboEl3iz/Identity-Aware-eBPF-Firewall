@@ -1,5 +1,5 @@
 # eBPF Firewall Engineering Makefile
-.PHONY: all deps build-bpf build netns-up netns-down cgroup-setup run-agent test-phase1 test-phase2 test-phase3 dump-maps monitor clean
+.PHONY: all deps build-bpf build netns-up netns-down cgroup-setup cgroup-down run-agent test-phase1 test-phase2 test-phase3 dump-maps monitor clean
 
 CLANG ?= clang
 CFLAGS ?= -O2 -g -Wall -target bpf -D__TARGET_ARCH_x86
@@ -45,6 +45,10 @@ netns-down:
 cgroup-setup:
 	@sudo ./scripts/setup_cgroup.sh
 
+cgroup-down:
+	@sudo ./scripts/teardown_cgroup.sh
+
+
 ## 5. Execution & Phase Integration Testing
 run-agent:
 	@echo "==> Running firewall agent in server netns attached to $(IFACE)..."
@@ -82,7 +86,7 @@ monitor:
 	sudo cat /sys/kernel/debug/tracing/trace_pipe
 
 ## 7. Clean Artifacts
-clean: netns-down
+clean: netns-down cgroup-down
 	@echo "==> Cleaning build artifacts..."
 	rm -rf bin/
 	rm -f pkg/bpf/xdp_bpf* pkg/bpf/tc_bpf*
