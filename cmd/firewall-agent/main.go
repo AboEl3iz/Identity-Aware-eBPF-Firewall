@@ -11,11 +11,12 @@ import (
 
 	"policy_engine/pkg/bpf"
 	"policy_engine/pkg/compiler"
+	"policy_engine/pkg/conntrack"
 	"policy_engine/pkg/observability"
 )
 
 func main() {
-	iface := flag.String("iface", "veth-s", "Network interface to attach XDP firewall")
+	iface := flag.String("iface", "veth-s", "Network interface to attach XDP & TC firewall")
 	configPath := flag.String("config", "configs/policy.example.yaml", "Path to YAML policy file")
 	blockCIDR := flag.String("block-cidr", "", "Optional CIDR block rule (e.g. 10.0.0.1/32)")
 	blockCgroup := flag.String("block-cgroup", "", "Optional cgroup path block rule (e.g. /sys/fs/cgroup/test-app-blocked)")
@@ -23,14 +24,14 @@ func main() {
 
 	log.Printf("[+] Starting eBPF Firewall Agent on interface '%s'...", *iface)
 
-	// Initialize BPF Loader & attach XDP hook
+	// Initialize BPF Loader & attach XDP + TC hooks
 	loader, err := bpf.NewFirewallLoader(*iface)
 	if err != nil {
 		log.Fatalf("[!] Failed to initialize BPF loader: %v", err)
 	}
 	defer loader.Close()
 
-	log.Printf("[+] XDP program successfully attached to interface '%s'.", *iface)
+	log.Printf("[+] XDP & TC programs successfully attached to interface '%s'.", *iface)
 
 	// Load CIDR block rule if specified
 	if *blockCIDR != "" {
@@ -67,7 +68,6 @@ func main() {
 					for _, cg := range rule.SrcCgroups {
 						log.Printf("[+] Adding Cgroup block rule: %s (Rule ID: %d)", cg, rule.ID)
 						if err := loader.AddCgroupPathBlock(cg, rule.ID); err != nil {
-							// Also try full cgroup path under /sys/fs/cgroup
 							fullPath := "/sys/fs/cgroup" + cg
 							if err2 := loader.AddCgroupPathBlock(fullPath, rule.ID); err2 != nil {
 								log.Printf("[!] Error adding Cgroup %s (%v / %v)", cg, err, err2)
@@ -93,7 +93,9 @@ func main() {
 		}
 	}()
 
-	// Periodic stats reporter goroutine
+	conntrackTable := conntrack.NewTable()
+
+	// Periodic stats & conntrack reporter goroutine
 	go func() {
 		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()
@@ -107,17 +109,26 @@ func main() {
 					log.Printf("[STATS] RX Packets: %d | RX Bytes: %d | PASS: %d | DROP: %d",
 						stats.RxPackets, stats.RxBytes, stats.PassPackets, stats.DropPackets)
 				}
+
+				// Report active conntrack flows
+				flows, err := conntrackTable.SyncFromKernel(loader)
+				if err == nil && len(flows) > 0 {
+					for _, flow := range flows {
+						log.Printf("[CONNTRACK] Flow %s:%d -> %s:%d (Proto %d) State: %s Packets: %d Bytes: %d",
+							flow.SrcIP, flow.SrcPort, flow.DstIP, flow.DstPort, flow.Protocol, flow.State, flow.Packets, flow.Bytes)
+					}
+				}
 			}
 		}
 	}()
 
-	log.Println("[+] Firewall agent operational. Press Ctrl+C to terminate.")
+	log.Println("[+] Firewall agent operational (XDP + TC Conntrack active). Press Ctrl+C to terminate.")
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 
-	log.Println("[-] Shutting down firewall agent & detaching XDP program...")
+	log.Println("[-] Shutting down firewall agent & detaching XDP/TC programs...")
 	cancel()
 
 	// Print final stats
