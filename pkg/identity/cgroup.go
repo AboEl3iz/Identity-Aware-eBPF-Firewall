@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"syscall"
 )
 
@@ -15,8 +16,25 @@ func NewCgroupResolver() *CgroupResolver {
 }
 
 // GetCgroupID returns the 64-bit cgroup v2 ID (filesystem inode number) for a given cgroup directory path.
+// If the target cgroup directory does not exist, it attempts to auto-create it under /sys/fs/cgroup.
 func (r *CgroupResolver) GetCgroupID(cgroupPath string) (uint64, error) {
+	targetPath := cgroupPath
+	if !strings.HasPrefix(targetPath, "/sys/fs/cgroup") {
+		targetPath = "/sys/fs/cgroup/" + strings.TrimPrefix(targetPath, "/")
+	}
+
 	fi, err := os.Stat(cgroupPath)
+	if err != nil {
+		fi, err = os.Stat(targetPath)
+	}
+
+	// Auto-create cgroup directory if it doesn't exist yet
+	if err != nil {
+		if errMk := os.MkdirAll(targetPath, 0755); errMk == nil {
+			fi, err = os.Stat(targetPath)
+		}
+	}
+
 	if err != nil {
 		return 0, fmt.Errorf("failed to stat cgroup path %s: %w", cgroupPath, err)
 	}
