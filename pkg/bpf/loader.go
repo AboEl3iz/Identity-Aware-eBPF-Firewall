@@ -12,17 +12,19 @@ import (
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
+	"policy_engine/pkg/identity"
 	"policy_engine/pkg/observability"
 )
 
 // FirewallLoader manages loaded eBPF programs, link attachments, and map operations.
 type FirewallLoader struct {
-	ifaceName  string
-	iface      *net.Interface
-	objs       xdpObjects
-	xdpLink    link.Link
-	ringReader *ringbuf.Reader
-	mu         sync.RWMutex
+	ifaceName      string
+	iface          *net.Interface
+	objs           xdpObjects
+	xdpLink        link.Link
+	ringReader     *ringbuf.Reader
+	cgroupResolver *identity.CgroupResolver
+	mu             sync.RWMutex
 }
 
 // NewFirewallLoader initializes environment memory limits, loads eBPF objects, and attaches XDP program.
@@ -37,8 +39,9 @@ func NewFirewallLoader(ifaceName string) (*FirewallLoader, error) {
 	}
 
 	loader := &FirewallLoader{
-		ifaceName: ifaceName,
-		iface:     iface,
+		ifaceName:      ifaceName,
+		iface:          iface,
+		cgroupResolver: identity.NewCgroupResolver(),
 	}
 
 	// Load eBPF programs and maps into kernel
@@ -140,6 +143,37 @@ func (l *FirewallLoader) RemoveBlockCIDR(cidrStr string) error {
 	}
 
 	return nil
+}
+
+// AddCgroupIdentity inserts a cgroup v2 numeric ID mapping into cgroup_identity_map.
+func (l *FirewallLoader) AddCgroupIdentity(cgroupID uint64, identityID uint32) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if err := l.objs.CgroupIdentityMap.Put(&cgroupID, &identityID); err != nil {
+		return fmt.Errorf("failed to insert cgroup_id %d into cgroup_identity_map: %w", cgroupID, err)
+	}
+	return nil
+}
+
+// RemoveCgroupIdentity removes a cgroup v2 numeric ID mapping from cgroup_identity_map.
+func (l *FirewallLoader) RemoveCgroupIdentity(cgroupID uint64) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if err := l.objs.CgroupIdentityMap.Delete(&cgroupID); err != nil {
+		return fmt.Errorf("failed to delete cgroup_id %d from cgroup_identity_map: %w", cgroupID, err)
+	}
+	return nil
+}
+
+// AddCgroupPathBlock resolves a cgroup directory path to its inode ID and inserts it into cgroup_identity_map.
+func (l *FirewallLoader) AddCgroupPathBlock(cgroupPath string, identityID uint32) error {
+	cgroupID, err := l.cgroupResolver.GetCgroupID(cgroupPath)
+	if err != nil {
+		return fmt.Errorf("failed to resolve cgroup path %s: %w", cgroupPath, err)
+	}
+	return l.AddCgroupIdentity(cgroupID, identityID)
 }
 
 // Stats represents aggregated packet statistics across all CPUs.
