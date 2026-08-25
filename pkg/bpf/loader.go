@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"os/exec"
 	"sync"
 
 	"github.com/cilium/ebpf/link"
@@ -16,18 +18,20 @@ import (
 	"policy_engine/pkg/observability"
 )
 
-// FirewallLoader manages loaded eBPF programs, link attachments, and map operations.
+// FirewallLoader manages loaded eBPF programs (XDP + TC), link attachments, and map operations.
 type FirewallLoader struct {
 	ifaceName      string
 	iface          *net.Interface
 	objs           xdpObjects
+	tcObjs         tcObjects
 	xdpLink        link.Link
+	tcPinPath      string
 	ringReader     *ringbuf.Reader
 	cgroupResolver *identity.CgroupResolver
 	mu             sync.RWMutex
 }
 
-// NewFirewallLoader initializes environment memory limits, loads eBPF objects, and attaches XDP program.
+// NewFirewallLoader initializes environment memory limits, loads eBPF objects, and attaches XDP & TC programs.
 func NewFirewallLoader(ifaceName string) (*FirewallLoader, error) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return nil, fmt.Errorf("failed to remove memlock rlimit: %w", err)
@@ -42,21 +46,26 @@ func NewFirewallLoader(ifaceName string) (*FirewallLoader, error) {
 		ifaceName:      ifaceName,
 		iface:          iface,
 		cgroupResolver: identity.NewCgroupResolver(),
+		tcPinPath:      fmt.Sprintf("/sys/fs/bpf/tc_fw_%s", ifaceName),
 	}
 
-	// Load eBPF programs and maps into kernel
+	// 1. Ensure cgroup2 filesystem is mounted at /sys/fs/cgroup inside netns
+	if _, err := os.Stat("/sys/fs/cgroup/cgroup.procs"); err != nil {
+		exec.Command("mount", "-t", "cgroup2", "none", "/sys/fs/cgroup").Run()
+	}
+
+	// 2. Load XDP eBPF programs & maps
 	if err := loadXdpObjects(&loader.objs, nil); err != nil {
 		return nil, fmt.Errorf("failed to load XDP objects: %w", err)
 	}
 
-	// Attach XDP program to network interface (Generic mode works on veth and all drivers)
+	// Attach XDP program to network interface
 	l, err := link.AttachXDP(link.XDPOptions{
 		Program:   loader.objs.XdpFirewallFunc,
 		Interface: iface.Index,
 		Flags:     link.XDPGenericMode,
 	})
 	if err != nil {
-		// Fallback to default mode
 		l, err = link.AttachXDP(link.XDPOptions{
 			Program:   loader.objs.XdpFirewallFunc,
 			Interface: iface.Index,
@@ -68,10 +77,36 @@ func NewFirewallLoader(ifaceName string) (*FirewallLoader, error) {
 	}
 	loader.xdpLink = l
 
-	// Initialize ring buffer reader for verdict audit events
+	// 3. Load TC eBPF stateful conntrack programs & maps
+	if err := loadTcObjects(&loader.tcObjs, nil); err != nil {
+		l.Close()
+		loader.objs.Close()
+		return nil, fmt.Errorf("failed to load TC conntrack objects: %w", err)
+	}
+
+	// Mount BPF filesystem if not already mounted
+	os.MkdirAll("/sys/fs/bpf", 0755)
+	exec.Command("mount", "-t", "bpf", "bpffs", "/sys/fs/bpf").Run()
+
+	// Provision clsact qdisc & attach pinned TC BPF filter
+	os.Remove(loader.tcPinPath)
+	if err := loader.tcObjs.TcFirewallFunc.Pin(loader.tcPinPath); err != nil {
+		fmt.Printf("[!] Warning: Could not pin TC program to %s: %v\n", loader.tcPinPath, err)
+	}
+
+	exec.Command("tc", "qdisc", "add", "dev", ifaceName, "clsact").Run()
+	
+	tcCmd := exec.Command("tc", "filter", "add", "dev", ifaceName, "ingress", "bpf", "da", "object-pinned", loader.tcPinPath)
+	if out, err := tcCmd.CombinedOutput(); err != nil {
+		exec.Command("tc", "filter", "add", "dev", ifaceName, "ingress", "bpf", "da", "obj", "pkg/bpf/tc_bpf.o", "sec", "tc").Run()
+		_ = out
+	}
+
+	// 4. Initialize ring buffer reader for verdict audit events
 	reader, err := ringbuf.NewReader(loader.objs.AuditRingbuf)
 	if err != nil {
 		l.Close()
+		loader.tcObjs.Close()
 		loader.objs.Close()
 		return nil, fmt.Errorf("failed to create ringbuf reader: %w", err)
 	}
@@ -100,7 +135,6 @@ func (l *FirewallLoader) AddBlockCIDR(cidrStr string, ruleID uint32) error {
 	}
 
 	prefixLen, _ := ipNet.Mask.Size()
-	// Use LittleEndian so that in memory on x86, byte 0 is ip4[0] (matching iph->saddr byte order)
 	addrUint := binary.LittleEndian.Uint32(ip4)
 
 	key := xdpLpmKeyIpv4{
@@ -176,6 +210,57 @@ func (l *FirewallLoader) AddCgroupPathBlock(cgroupPath string, identityID uint32
 	return l.AddCgroupIdentity(cgroupID, identityID)
 }
 
+// ConntrackFlow represents an active 5-tuple connection flow query result.
+type ConntrackFlow struct {
+	SrcIP    net.IP
+	DstIP    net.IP
+	SrcPort  uint16
+	DstPort  uint16
+	Protocol uint8
+	State    uint32
+	Packets  uint64
+	Bytes    uint64
+}
+
+// GetConntrackFlows queries active connection flows from the kernel conntrack LRU map.
+func (l *FirewallLoader) GetConntrackFlows() ([]ConntrackFlow, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	var flows []ConntrackFlow
+	var key tcFlowKey
+	var val tcFlowState
+
+	iter := l.tcObjs.ConntrackMap.Iterate()
+	for iter.Next(&key, &val) {
+		src := intToIP(key.SrcIp)
+		dst := intToIP(key.DstIp)
+		flows = append(flows, ConntrackFlow{
+			SrcIP:    src,
+			DstIP:    dst,
+			SrcPort:  key.SrcPort,
+			DstPort:  key.DstPort,
+			Protocol: key.Protocol,
+			State:    val.State,
+			Packets:  val.Packets,
+			Bytes:    val.Bytes,
+		})
+	}
+	if err := iter.Err(); err != nil {
+		return nil, fmt.Errorf("conntrack map iteration error: %w", err)
+	}
+	return flows, nil
+}
+
+func intToIP(nn uint32) net.IP {
+	ip := make(net.IP, 4)
+	ip[0] = byte(nn)
+	ip[1] = byte(nn >> 8)
+	ip[2] = byte(nn >> 16)
+	ip[3] = byte(nn >> 24)
+	return ip
+}
+
 // Stats represents aggregated packet statistics across all CPUs.
 type Stats struct {
 	RxPackets   uint64
@@ -184,21 +269,29 @@ type Stats struct {
 	DropPackets uint64
 }
 
-// GetStats queries and aggregates per-CPU packet statistics from xdp_stats_map.
+// GetStats queries and aggregates per-CPU packet statistics from xdp_stats_map and tc_stats_map.
 func (l *FirewallLoader) GetStats() (Stats, error) {
 	var total Stats
 	var perCPU []xdpStatsValue
 
 	var key uint32 = 0
-	if err := l.objs.XdpStatsMap.Lookup(&key, &perCPU); err != nil {
-		return total, fmt.Errorf("failed to lookup stats map: %w", err)
+	if err := l.objs.XdpStatsMap.Lookup(&key, &perCPU); err == nil {
+		for _, cpuStats := range perCPU {
+			total.RxPackets += cpuStats.RxPackets
+			total.RxBytes += cpuStats.RxBytes
+			total.PassPackets += cpuStats.PassPackets
+			total.DropPackets += cpuStats.DropPackets
+		}
 	}
 
-	for _, cpuStats := range perCPU {
-		total.RxPackets += cpuStats.RxPackets
-		total.RxBytes += cpuStats.RxBytes
-		total.PassPackets += cpuStats.PassPackets
-		total.DropPackets += cpuStats.DropPackets
+	var tcPerCPU []tcStatsValue
+	if err := l.tcObjs.TcStatsMap.Lookup(&key, &tcPerCPU); err == nil {
+		for _, cpuStats := range tcPerCPU {
+			total.RxPackets += cpuStats.RxPackets
+			total.RxBytes += cpuStats.RxBytes
+			total.PassPackets += cpuStats.PassPackets
+			total.DropPackets += cpuStats.DropPackets
+		}
 	}
 
 	return total, nil
@@ -231,7 +324,7 @@ func (l *FirewallLoader) ReadRingbuf(ctx context.Context, handler func(observabi
 	}
 }
 
-// Close detaches XDP links, closes ringbuf reader, and unloads BPF objects.
+// Close detaches XDP & TC links, closes ringbuf reader, and unloads BPF objects.
 func (l *FirewallLoader) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -242,5 +335,12 @@ func (l *FirewallLoader) Close() error {
 	if l.xdpLink != nil {
 		l.xdpLink.Close()
 	}
+	// Clean up clsact qdisc and pinned BPF object
+	exec.Command("tc", "qdisc", "del", "dev", l.ifaceName, "clsact").Run()
+	if l.tcPinPath != "" {
+		os.Remove(l.tcPinPath)
+	}
+
+	l.tcObjs.Close()
 	return l.objs.Close()
 }
