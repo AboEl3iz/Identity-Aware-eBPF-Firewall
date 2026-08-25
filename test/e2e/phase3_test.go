@@ -1,9 +1,9 @@
 package e2e
 
 import (
-	"os"
+	
 	"os/exec"
-	"path/filepath"
+	
 	"strings"
 	"testing"
 	"time"
