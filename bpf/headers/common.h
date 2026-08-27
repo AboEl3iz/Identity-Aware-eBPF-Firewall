@@ -8,6 +8,10 @@
 #define VERDICT_DROP     1
 #define VERDICT_REDIRECT 2
 
+/* Action Codes */
+#define ACTION_ALLOW     1
+#define ACTION_DENY      2
+
 /* Reason Codes for Explainability */
 #define REASON_OK                   0
 #define REASON_CIDR_BLOCKED         1
@@ -22,10 +26,32 @@
 #define PROTO_TCP  6
 #define PROTO_UDP  17
 
-/* IPv4 LPM Trie Key Structure */
+/* Generation-aware IPv4 LPM Trie Key Structure */
 struct lpm_key_ipv4 {
-    __u32 prefixlen; /* Prefix length in bits (0..32) */
+    __u32 prefixlen; /* Prefix length in bits (32 for gen + 0..32 for IPv4) */
+    __u32 gen;       /* Generation index */
     __u32 addr;      /* IPv4 address in network byte order */
+};
+
+/* Generation-aware Cgroup Key Structure */
+struct cgroup_key {
+    __u32 gen;       /* Generation index */
+    __u32 pad;       /* Alignment padding */
+    __u64 cgroup_id; /* 64-bit cgroup v2 ID */
+};
+
+/* Generation-aware Port/Protocol Rule Key Structure */
+struct port_rule_key {
+    __u32 gen;       /* Generation index */
+    __u16 dst_port;  /* Destination port */
+    __u8  protocol;  /* IP protocol (TCP, UDP, etc.) */
+    __u8  pad;       /* Alignment padding */
+};
+
+/* Port/Protocol Rule Value Structure */
+struct port_rule_val {
+    __u32 action;    /* ACTION_ALLOW or ACTION_DENY */
+    __u32 rule_id;   /* Matched rule identifier */
 };
 
 /* 5-Tuple Flow Key for Conntrack */
