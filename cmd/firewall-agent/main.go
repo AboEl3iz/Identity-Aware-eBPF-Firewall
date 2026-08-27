@@ -12,12 +12,14 @@ import (
 	"policy_engine/pkg/bpf"
 	"policy_engine/pkg/compiler"
 	"policy_engine/pkg/conntrack"
+	"policy_engine/pkg/control"
 	"policy_engine/pkg/observability"
 )
 
 func main() {
 	iface := flag.String("iface", "veth-s", "Network interface to attach XDP & TC firewall")
 	configPath := flag.String("config", "configs/policy.example.yaml", "Path to YAML policy file")
+	socketPath := flag.String("socket", "/var/run/firewall-agent.sock", "Path to Unix domain socket for IPC control plane")
 	blockCIDR := flag.String("block-cidr", "", "Optional CIDR block rule (e.g. 10.0.0.1/32)")
 	blockCgroup := flag.String("block-cgroup", "", "Optional cgroup path block rule (e.g. /sys/fs/cgroup/test-app-blocked)")
 	flag.Parse()
@@ -32,6 +34,19 @@ func main() {
 	defer loader.Close()
 
 	log.Printf("[+] XDP & TC programs successfully attached to interface '%s'.", *iface)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	auditStore := observability.NewAuditStore(1000)
+
+	// Start Unix Domain Socket Control Server
+	ctrlServer := control.NewControlServer(*socketPath, loader, auditStore)
+	go func() {
+		if err := ctrlServer.Start(ctx); err != nil {
+			log.Printf("[!] Control Server error: %v", err)
+		}
+	}()
 
 	// Load CIDR block rule if specified
 	if *blockCIDR != "" {
@@ -49,44 +64,34 @@ func main() {
 		}
 	}
 
-	// Parse policy config file if specified
+	// Parse & compile policy config file if specified
 	if *configPath != "" && *blockCIDR == "" && *blockCgroup == "" {
 		comp := compiler.NewCompiler()
 		pol, err := comp.ParseFile(*configPath)
 		if err != nil {
 			log.Printf("[!] Warning: Could not parse config %s: %v. Continuing without initial rules.", *configPath, err)
 		} else {
-			log.Printf("[+] Policy '%s' loaded. Processing rules...", pol.Metadata.Name)
-			for _, rule := range pol.Spec.Rules {
-				if rule.Action == "deny" {
-					for _, cidr := range rule.SrcCIDRs {
-						log.Printf("[+] Adding CIDR block rule: %s (Rule ID: %d)", cidr, rule.ID)
-						if err := loader.AddBlockCIDR(cidr, rule.ID); err != nil {
-							log.Printf("[!] Error adding CIDR %s: %v", cidr, err)
-						}
-					}
-					for _, cg := range rule.SrcCgroups {
-						log.Printf("[+] Adding Cgroup block rule: %s (Rule ID: %d)", cg, rule.ID)
-						if err := loader.AddCgroupPathBlock(cg, rule.ID); err != nil {
-							fullPath := "/sys/fs/cgroup" + cg
-							if err2 := loader.AddCgroupPathBlock(fullPath, rule.ID); err2 != nil {
-								log.Printf("[!] Error adding Cgroup %s (%v / %v)", cg, err, err2)
-							}
-						}
-					}
+			cp, err := comp.Compile(pol)
+			if err != nil {
+				log.Printf("[!] Warning: Could not compile policy AST: %v", err)
+			} else {
+				swapper := compiler.NewMapSwapper()
+				gen, err := swapper.ApplyPolicyAtomic(loader, cp)
+				if err != nil {
+					log.Printf("[!] Warning: Could not apply initial policy atomically: %v", err)
+				} else {
+					log.Printf("[+] Policy '%s' loaded atomically (Generation %d).", pol.Metadata.Name, gen)
 				}
 			}
 		}
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	// Start BPF Ring Buffer audit event streaming
 	go func() {
 		log.Println("[+] Ring buffer audit event stream active.")
 		err := loader.ReadRingbuf(ctx, func(evt observability.AuditEvent) {
 			log.Printf("[AUDIT EVENT] %s", evt.String())
+			auditStore.Add(evt)
 		})
 		if err != nil && ctx.Err() == nil {
 			log.Printf("[!] Ringbuf consumer error: %v", err)
@@ -122,7 +127,7 @@ func main() {
 		}
 	}()
 
-	log.Println("[+] Firewall agent operational (XDP + TC Conntrack active). Press Ctrl+C to terminate.")
+	log.Println("[+] Firewall agent operational (XDP + TC Conntrack + Control Server active). Press Ctrl+C to terminate.")
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -138,3 +143,4 @@ func main() {
 			finalStats.RxPackets, finalStats.RxBytes, finalStats.PassPackets, finalStats.DropPackets)
 	}
 }
+
