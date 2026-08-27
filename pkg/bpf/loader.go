@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 
 	"github.com/cilium/ebpf/link"
@@ -115,8 +116,113 @@ func NewFirewallLoader(ifaceName string) (*FirewallLoader, error) {
 	return loader, nil
 }
 
-// AddBlockCIDR inserts an IPv4 CIDR block rule into the LPM trie map.
+// AddBlockCIDR inserts an IPv4 CIDR block rule into the LPM trie map for active generation.
 func (l *FirewallLoader) AddBlockCIDR(cidrStr string, ruleID uint32) error {
+	gen, _ := l.GetActiveGeneration()
+	return l.StageCIDRRule(gen, cidrStr, ruleID, "deny")
+}
+
+// RemoveBlockCIDR removes an IPv4 CIDR block rule from the LPM trie map for active generation.
+func (l *FirewallLoader) RemoveBlockCIDR(cidrStr string) error {
+	gen, _ := l.GetActiveGeneration()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	_, ipNet, err := net.ParseCIDR(cidrStr)
+	if err != nil {
+		ip := net.ParseIP(cidrStr)
+		if ip == nil || ip.To4() == nil {
+			return fmt.Errorf("invalid CIDR or IPv4 address: %s", cidrStr)
+		}
+		_, ipNet, _ = net.ParseCIDR(cidrStr + "/32")
+	}
+
+	ip4 := ipNet.IP.To4()
+	prefixLen, _ := ipNet.Mask.Size()
+	addrUint := binary.LittleEndian.Uint32(ip4)
+
+	key := xdpLpmKeyIpv4{
+		Prefixlen: uint32(32 + prefixLen),
+		Gen:       gen,
+		Addr:      addrUint,
+	}
+
+	if err := l.objs.LpmBlocklist.Delete(&key); err != nil {
+		return fmt.Errorf("failed to delete CIDR %s from BPF LPM blocklist: %w", cidrStr, err)
+	}
+
+	return nil
+}
+
+// AddCgroupIdentity inserts a cgroup v2 numeric ID mapping into cgroup_identity_map for active generation.
+func (l *FirewallLoader) AddCgroupIdentity(cgroupID uint64, identityID uint32) error {
+	gen, _ := l.GetActiveGeneration()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	key := xdpCgroupKey{
+		Gen:      gen,
+		Pad:      0,
+		CgroupId: cgroupID,
+	}
+
+	if err := l.objs.CgroupIdentityMap.Put(&key, &identityID); err != nil {
+		return fmt.Errorf("failed to insert cgroup_id %d into cgroup_identity_map: %w", cgroupID, err)
+	}
+	return nil
+}
+
+// RemoveCgroupIdentity removes a cgroup v2 numeric ID mapping from cgroup_identity_map for active generation.
+func (l *FirewallLoader) RemoveCgroupIdentity(cgroupID uint64) error {
+	gen, _ := l.GetActiveGeneration()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	key := xdpCgroupKey{
+		Gen:      gen,
+		Pad:      0,
+		CgroupId: cgroupID,
+	}
+
+	if err := l.objs.CgroupIdentityMap.Delete(&key); err != nil {
+		return fmt.Errorf("failed to delete cgroup_id %d from cgroup_identity_map: %w", cgroupID, err)
+	}
+	return nil
+}
+
+// AddCgroupPathBlock resolves a cgroup directory path to its inode ID and inserts it into cgroup_identity_map for active generation.
+func (l *FirewallLoader) AddCgroupPathBlock(cgroupPath string, identityID uint32) error {
+	gen, _ := l.GetActiveGeneration()
+	return l.StageCgroupRule(gen, cgroupPath, identityID, "deny")
+}
+
+// GetActiveGeneration returns the active policy generation index from kernel BPF array map.
+func (l *FirewallLoader) GetActiveGeneration() (uint32, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	var key uint32 = 0
+	var gen uint32
+	if err := l.objs.ActiveGenerationMap.Lookup(&key, &gen); err != nil {
+		return 0, nil
+	}
+	return gen, nil
+}
+
+// SetActiveGeneration updates the active policy generation index in kernel BPF array map.
+func (l *FirewallLoader) SetActiveGeneration(gen uint32) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	var key uint32 = 0
+	if err := l.objs.ActiveGenerationMap.Put(&key, &gen); err != nil {
+		return fmt.Errorf("failed to update active_generation_map to %d: %w", gen, err)
+	}
+	return nil
+}
+
+// StageCIDRRule inserts a generation-indexed CIDR rule into BPF LPM blocklist.
+func (l *FirewallLoader) StageCIDRRule(gen uint32, cidrStr string, ruleID uint32, action string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -138,77 +244,126 @@ func (l *FirewallLoader) AddBlockCIDR(cidrStr string, ruleID uint32) error {
 	addrUint := binary.LittleEndian.Uint32(ip4)
 
 	key := xdpLpmKeyIpv4{
-		Prefixlen: uint32(prefixLen),
+		Prefixlen: uint32(32 + prefixLen),
+		Gen:       gen,
 		Addr:      addrUint,
 	}
 
 	if err := l.objs.LpmBlocklist.Put(&key, &ruleID); err != nil {
-		return fmt.Errorf("failed to insert CIDR %s into BPF LPM blocklist: %w", cidrStr, err)
+		return fmt.Errorf("failed to stage CIDR %s (gen %d): %w", cidrStr, gen, err)
 	}
-
 	return nil
 }
 
-// RemoveBlockCIDR removes an IPv4 CIDR block rule from the LPM trie map.
-func (l *FirewallLoader) RemoveBlockCIDR(cidrStr string) error {
+// StageCgroupRule resolves a cgroup path and inserts a generation-indexed cgroup rule.
+func (l *FirewallLoader) StageCgroupRule(gen uint32, cgroupPath string, ruleID uint32, action string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	_, ipNet, err := net.ParseCIDR(cidrStr)
-	if err != nil {
-		ip := net.ParseIP(cidrStr)
-		if ip == nil || ip.To4() == nil {
-			return fmt.Errorf("invalid CIDR or IPv4 address: %s", cidrStr)
-		}
-		_, ipNet, _ = net.ParseCIDR(cidrStr + "/32")
-	}
-
-	ip4 := ipNet.IP.To4()
-	prefixLen, _ := ipNet.Mask.Size()
-	addrUint := binary.LittleEndian.Uint32(ip4)
-
-	key := xdpLpmKeyIpv4{
-		Prefixlen: uint32(prefixLen),
-		Addr:      addrUint,
-	}
-
-	if err := l.objs.LpmBlocklist.Delete(&key); err != nil {
-		return fmt.Errorf("failed to delete CIDR %s from BPF LPM blocklist: %w", cidrStr, err)
-	}
-
-	return nil
-}
-
-// AddCgroupIdentity inserts a cgroup v2 numeric ID mapping into cgroup_identity_map.
-func (l *FirewallLoader) AddCgroupIdentity(cgroupID uint64, identityID uint32) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if err := l.objs.CgroupIdentityMap.Put(&cgroupID, &identityID); err != nil {
-		return fmt.Errorf("failed to insert cgroup_id %d into cgroup_identity_map: %w", cgroupID, err)
-	}
-	return nil
-}
-
-// RemoveCgroupIdentity removes a cgroup v2 numeric ID mapping from cgroup_identity_map.
-func (l *FirewallLoader) RemoveCgroupIdentity(cgroupID uint64) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if err := l.objs.CgroupIdentityMap.Delete(&cgroupID); err != nil {
-		return fmt.Errorf("failed to delete cgroup_id %d from cgroup_identity_map: %w", cgroupID, err)
-	}
-	return nil
-}
-
-// AddCgroupPathBlock resolves a cgroup directory path to its inode ID and inserts it into cgroup_identity_map.
-func (l *FirewallLoader) AddCgroupPathBlock(cgroupPath string, identityID uint32) error {
 	cgroupID, err := l.cgroupResolver.GetCgroupID(cgroupPath)
 	if err != nil {
 		return fmt.Errorf("failed to resolve cgroup path %s: %w", cgroupPath, err)
 	}
-	return l.AddCgroupIdentity(cgroupID, identityID)
+
+	key := xdpCgroupKey{
+		Gen:      gen,
+		Pad:      0,
+		CgroupId: cgroupID,
+	}
+
+	if err := l.objs.CgroupIdentityMap.Put(&key, &ruleID); err != nil {
+		return fmt.Errorf("failed to stage cgroup %s (gen %d): %w", cgroupPath, gen, err)
+	}
+	return nil
 }
+
+// StagePortRule inserts a generation-indexed port/protocol rule into BPF PortRulesMap.
+func (l *FirewallLoader) StagePortRule(gen uint32, port uint16, protocol string, ruleID uint32, action string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	var protoVal uint8 = 6 // TCP
+	switch strings.ToLower(protocol) {
+	case "tcp":
+		protoVal = 6
+	case "udp":
+		protoVal = 17
+	case "icmp":
+		protoVal = 1
+	}
+
+	var actVal uint32 = 2 // ACTION_DENY = 2
+	if strings.ToLower(action) == "allow" {
+		actVal = 1 // ACTION_ALLOW = 1
+	}
+
+	key := xdpPortRuleKey{
+		Gen:      gen,
+		DstPort:  port,
+		Protocol: protoVal,
+		Pad:      0,
+	}
+
+	val := xdpPortRuleVal{
+		Action: actVal,
+		RuleId: ruleID,
+	}
+
+	if err := l.objs.PortRulesMap.Put(&key, &val); err != nil {
+		return fmt.Errorf("failed to stage port rule %d/%s (gen %d): %w", port, protocol, gen, err)
+	}
+	return nil
+}
+
+// ClearGenerationRules purges all BPF map rules associated with a specific generation index.
+func (l *FirewallLoader) ClearGenerationRules(gen uint32) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// Clear LpmBlocklist keys
+	var lpmKeysToDelete []xdpLpmKeyIpv4
+	var lpmKey xdpLpmKeyIpv4
+	var ruleID uint32
+	iterLpm := l.objs.LpmBlocklist.Iterate()
+	for iterLpm.Next(&lpmKey, &ruleID) {
+		if lpmKey.Gen == gen {
+			lpmKeysToDelete = append(lpmKeysToDelete, lpmKey)
+		}
+	}
+	for _, k := range lpmKeysToDelete {
+		_ = l.objs.LpmBlocklist.Delete(&k)
+	}
+
+	// Clear CgroupIdentityMap keys
+	var cgKeysToDelete []xdpCgroupKey
+	var cgKey xdpCgroupKey
+	iterCg := l.objs.CgroupIdentityMap.Iterate()
+	for iterCg.Next(&cgKey, &ruleID) {
+		if cgKey.Gen == gen {
+			cgKeysToDelete = append(cgKeysToDelete, cgKey)
+		}
+	}
+	for _, k := range cgKeysToDelete {
+		_ = l.objs.CgroupIdentityMap.Delete(&k)
+	}
+
+	// Clear PortRulesMap keys
+	var portKeysToDelete []xdpPortRuleKey
+	var portKey xdpPortRuleKey
+	var portVal xdpPortRuleVal
+	iterPort := l.objs.PortRulesMap.Iterate()
+	for iterPort.Next(&portKey, &portVal) {
+		if portKey.Gen == gen {
+			portKeysToDelete = append(portKeysToDelete, portKey)
+		}
+	}
+	for _, k := range portKeysToDelete {
+		_ = l.objs.PortRulesMap.Delete(&k)
+	}
+
+	return nil
+}
+
 
 // ConntrackFlow represents an active 5-tuple connection flow query result.
 type ConntrackFlow struct {
