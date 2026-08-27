@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"time"
 )
 
 // AuditEvent mirrors struct audit_event in bpf/headers/common.h
@@ -21,15 +22,74 @@ type AuditEvent struct {
 	IdentityID  uint32
 }
 
-func (e *AuditEvent) String() string {
-	src := intToIP(e.SrcIP)
-	dst := intToIP(e.DstIP)
-	verdictStr := "PASS"
-	if e.Verdict == 1 {
-		verdictStr = "DROP"
+func (e *AuditEvent) FormattedSrcIP() string {
+	return intToIP(e.SrcIP).String()
+}
+
+func (e *AuditEvent) FormattedDstIP() string {
+	return intToIP(e.DstIP).String()
+}
+
+func (e *AuditEvent) VerdictString() string {
+	switch e.Verdict {
+	case 0:
+		return "PASS"
+	case 1:
+		return "DROP"
+	case 2:
+		return "REDIRECT"
+	default:
+		return "UNKNOWN"
 	}
-	return fmt.Sprintf("[%s] %s:%d -> %s:%d (Proto %d) Reason=%d RuleID=%d CgroupID=%d IdentityID=%d",
-		verdictStr, src, e.SrcPort, dst, e.DstPort, e.Protocol, e.ReasonCode, e.RuleID, e.CgroupID, e.IdentityID)
+}
+
+func (e *AuditEvent) ReasonString() string {
+	switch e.ReasonCode {
+	case 0:
+		return "OK"
+	case 1:
+		return "CIDR_BLOCKED"
+	case 2:
+		return "PORT_BLOCKED"
+	case 3:
+		return "INVALID_TCP_FLAGS"
+	case 4:
+		return "IDENTITY_DENY"
+	case 5:
+		return "UNTRACKED_NON_SYN"
+	case 6:
+		return "DEFAULT_DROP"
+	default:
+		return fmt.Sprintf("REASON_%d", e.ReasonCode)
+	}
+}
+
+func (e *AuditEvent) ProtocolString() string {
+	switch e.Protocol {
+	case 1:
+		return "ICMP"
+	case 6:
+		return "TCP"
+	case 17:
+		return "UDP"
+	default:
+		return fmt.Sprintf("PROTO_%d", e.Protocol)
+	}
+}
+
+func (e *AuditEvent) TimestampFormatted() string {
+	if e.TimestampNS == 0 {
+		return time.Now().Format("15:04:05.000")
+	}
+	// Convert kernel timestamp to readable time string
+	sec := int64(e.TimestampNS / 1e9)
+	nsec := int64(e.TimestampNS % 1e9)
+	return time.Unix(sec, nsec).Format("15:04:05.000")
+}
+
+func (e *AuditEvent) String() string {
+	return fmt.Sprintf("[%s] %s:%d -> %s:%d (%s) Reason=%s RuleID=%d CgroupID=%d IdentityID=%d",
+		e.VerdictString(), e.FormattedSrcIP(), e.SrcPort, e.FormattedDstIP(), e.DstPort, e.ProtocolString(), e.ReasonString(), e.RuleID, e.CgroupID, e.IdentityID)
 }
 
 func intToIP(nn uint32) net.IP {
@@ -52,3 +112,4 @@ func (c *RingbufConsumer) Start(ctx context.Context, handler func(AuditEvent)) e
 	<-ctx.Done()
 	return nil
 }
+
