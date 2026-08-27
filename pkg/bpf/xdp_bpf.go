@@ -12,10 +12,32 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type xdpCgroupKey struct {
+	_        structs.HostLayout
+	Gen      uint32
+	Pad      uint32
+	CgroupId uint64
+}
+
 type xdpLpmKeyIpv4 struct {
 	_         structs.HostLayout
 	Prefixlen uint32
+	Gen       uint32
 	Addr      uint32
+}
+
+type xdpPortRuleKey struct {
+	_        structs.HostLayout
+	Gen      uint32
+	DstPort  uint16
+	Protocol uint8
+	Pad      uint8
+}
+
+type xdpPortRuleVal struct {
+	_      structs.HostLayout
+	Action uint32
+	RuleId uint32
 }
 
 type xdpStatsValue struct {
@@ -30,11 +52,13 @@ type xdpStatsValue struct {
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
-	xdpMapAuditRingbuf      = "audit_ringbuf"
-	xdpMapCgroupIdentityMap = "cgroup_identity_map"
-	xdpMapLpmBlocklist      = "lpm_blocklist"
-	xdpMapXdpStatsMap       = "xdp_stats_map"
-	xdpProgXdpFirewallFunc  = "xdp_firewall_func"
+	xdpMapActiveGenerationMap = "active_generation_map"
+	xdpMapAuditRingbuf        = "audit_ringbuf"
+	xdpMapCgroupIdentityMap   = "cgroup_identity_map"
+	xdpMapLpmBlocklist        = "lpm_blocklist"
+	xdpMapPortRulesMap        = "port_rules_map"
+	xdpMapXdpStatsMap         = "xdp_stats_map"
+	xdpProgXdpFirewallFunc    = "xdp_firewall_func"
 )
 
 // loadXdp returns the embedded CollectionSpec for xdp.
@@ -86,10 +110,12 @@ type xdpProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type xdpMapSpecs struct {
-	AuditRingbuf      *ebpf.MapSpec `ebpf:"audit_ringbuf"`
-	CgroupIdentityMap *ebpf.MapSpec `ebpf:"cgroup_identity_map"`
-	LpmBlocklist      *ebpf.MapSpec `ebpf:"lpm_blocklist"`
-	XdpStatsMap       *ebpf.MapSpec `ebpf:"xdp_stats_map"`
+	ActiveGenerationMap *ebpf.MapSpec `ebpf:"active_generation_map"`
+	AuditRingbuf        *ebpf.MapSpec `ebpf:"audit_ringbuf"`
+	CgroupIdentityMap   *ebpf.MapSpec `ebpf:"cgroup_identity_map"`
+	LpmBlocklist        *ebpf.MapSpec `ebpf:"lpm_blocklist"`
+	PortRulesMap        *ebpf.MapSpec `ebpf:"port_rules_map"`
+	XdpStatsMap         *ebpf.MapSpec `ebpf:"xdp_stats_map"`
 }
 
 // xdpVariableSpecs contains global variables before they are loaded into the kernel.
@@ -118,17 +144,21 @@ func (o *xdpObjects) Close() error {
 //
 // It can be passed to loadXdpObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xdpMaps struct {
-	AuditRingbuf      *ebpf.Map `ebpf:"audit_ringbuf"`
-	CgroupIdentityMap *ebpf.Map `ebpf:"cgroup_identity_map"`
-	LpmBlocklist      *ebpf.Map `ebpf:"lpm_blocklist"`
-	XdpStatsMap       *ebpf.Map `ebpf:"xdp_stats_map"`
+	ActiveGenerationMap *ebpf.Map `ebpf:"active_generation_map"`
+	AuditRingbuf        *ebpf.Map `ebpf:"audit_ringbuf"`
+	CgroupIdentityMap   *ebpf.Map `ebpf:"cgroup_identity_map"`
+	LpmBlocklist        *ebpf.Map `ebpf:"lpm_blocklist"`
+	PortRulesMap        *ebpf.Map `ebpf:"port_rules_map"`
+	XdpStatsMap         *ebpf.Map `ebpf:"xdp_stats_map"`
 }
 
 func (m *xdpMaps) Close() error {
 	return _XdpClose(
+		m.ActiveGenerationMap,
 		m.AuditRingbuf,
 		m.CgroupIdentityMap,
 		m.LpmBlocklist,
+		m.PortRulesMap,
 		m.XdpStatsMap,
 	)
 }
