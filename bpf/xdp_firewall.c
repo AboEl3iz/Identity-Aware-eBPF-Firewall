@@ -190,29 +190,54 @@ int xdp_firewall_func(struct xdp_md *ctx) {
         };
 
         struct port_rule_val *pr_val = bpf_map_lookup_elem(&port_rules_map, &pr_key);
-        if (pr_val && pr_val->action == ACTION_DENY) {
-            if (stats) {
-                stats->drop_packets++;
-            }
+        if (pr_val) {
+            if (pr_val->action == ACTION_DENY) {
+                if (stats) {
+                    stats->drop_packets++;
+                }
 
-            struct audit_event *event = bpf_ringbuf_reserve(&audit_ringbuf, sizeof(*event), 0);
-            if (event) {
-                event->timestamp_ns = bpf_ktime_get_ns();
-                event->src_ip = iph->saddr;
-                event->dst_ip = iph->daddr;
-                event->src_port = src_port;
-                event->dst_port = dst_port;
-                event->protocol = iph->protocol;
-                event->verdict = VERDICT_DROP;
-                event->reason_code = REASON_PORT_BLOCKED;
-                event->rule_id = pr_val->rule_id;
-                event->cgroup_id = cgroup_id;
-                event->identity_id = 0;
-                event->pad = 0;
-                bpf_ringbuf_submit(event, 0);
-            }
+                struct audit_event *event = bpf_ringbuf_reserve(&audit_ringbuf, sizeof(*event), 0);
+                if (event) {
+                    event->timestamp_ns = bpf_ktime_get_ns();
+                    event->src_ip = iph->saddr;
+                    event->dst_ip = iph->daddr;
+                    event->src_port = src_port;
+                    event->dst_port = dst_port;
+                    event->protocol = iph->protocol;
+                    event->verdict = VERDICT_DROP;
+                    event->reason_code = REASON_PORT_BLOCKED;
+                    event->rule_id = pr_val->rule_id;
+                    event->cgroup_id = cgroup_id;
+                    event->identity_id = 0;
+                    event->pad = 0;
+                    bpf_ringbuf_submit(event, 0);
+                }
 
-            return XDP_DROP;
+                return XDP_DROP;
+            } else if (pr_val->action == ACTION_ALLOW) {
+                if (stats) {
+                    stats->pass_packets++;
+                }
+
+                struct audit_event *event = bpf_ringbuf_reserve(&audit_ringbuf, sizeof(*event), 0);
+                if (event) {
+                    event->timestamp_ns = bpf_ktime_get_ns();
+                    event->src_ip = iph->saddr;
+                    event->dst_ip = iph->daddr;
+                    event->src_port = src_port;
+                    event->dst_port = dst_port;
+                    event->protocol = iph->protocol;
+                    event->verdict = VERDICT_PASS;
+                    event->reason_code = REASON_OK;
+                    event->rule_id = pr_val->rule_id;
+                    event->cgroup_id = cgroup_id;
+                    event->identity_id = 0;
+                    event->pad = 0;
+                    bpf_ringbuf_submit(event, 0);
+                }
+
+                return XDP_PASS;
+            }
         }
     }
 
