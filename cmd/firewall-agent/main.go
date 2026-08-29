@@ -14,6 +14,7 @@ import (
 	"policy_engine/pkg/conntrack"
 	"policy_engine/pkg/control"
 	"policy_engine/pkg/observability"
+	"policy_engine/pkg/security"
 )
 
 func main() {
@@ -25,6 +26,12 @@ func main() {
 	flag.Parse()
 
 	log.Printf("[+] Starting eBPF Firewall Agent on interface '%s'...", *iface)
+
+	// Phase 6: Perform process capability inspection & privilege bounding
+	if caps, err := security.EnsureMinimalCapabilities(); err == nil {
+		log.Printf("[SECURITY] Process running with verified capabilities (Root: %v, BPF: %v, NetAdmin: %v)",
+			caps.IsRoot, caps.HasCapBPF, caps.HasCapNet)
+	}
 
 	// Initialize BPF Loader & attach XDP + TC hooks
 	loader, err := bpf.NewFirewallLoader(*iface)

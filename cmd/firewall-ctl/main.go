@@ -45,12 +45,16 @@ func main() {
 
 			if !resp.Success {
 				fmt.Printf("[!] Policy apply failed: %s\n", resp.Error)
+				if resp.CallerRole != "" {
+					fmt.Printf("    Caller Identity: UID=%d Role=%s\n", resp.CallerUID, resp.CallerRole)
+				}
 				os.Exit(1)
 			}
 
 			fmt.Printf("[+] Policy applied successfully!\n")
+			fmt.Printf("    Caller Identity:   UID=%d (Role: %s)\n", resp.CallerUID, resp.CallerRole)
 			fmt.Printf("    Active Generation: %d\n", resp.ActiveGeneration)
-			fmt.Printf("    Rules Staged:     %d\n", resp.RulesCount)
+			fmt.Printf("    Rules Staged:      %d\n", resp.RulesCount)
 
 		case "status":
 			fs := flag.NewFlagSet("policy status", flag.ExitOnError)
@@ -70,6 +74,9 @@ func main() {
 			}
 
 			fmt.Println("=== Firewall Agent Status ===")
+			if resp.CallerRole != "" {
+				fmt.Printf("Authenticated As:  UID=%d (Role: %s)\n", resp.CallerUID, resp.CallerRole)
+			}
 			fmt.Printf("Active Generation: %d\n", resp.ActiveGeneration)
 			if resp.Stats != nil {
 				fmt.Printf("RX Packets:        %d\n", resp.Stats.RxPackets)
@@ -106,6 +113,9 @@ func main() {
 		}
 
 		fmt.Println("=== Active BPF Map State ===")
+		if resp.CallerRole != "" {
+			fmt.Printf("Authenticated As:  UID=%d (Role: %s)\n", resp.CallerUID, resp.CallerRole)
+		}
 		fmt.Printf("Active Generation: %d\n", resp.ActiveGeneration)
 
 	default:
