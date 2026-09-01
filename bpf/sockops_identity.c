@@ -29,6 +29,12 @@ struct {
     __type(value, struct stats_value);
 } sockops_stats_map SEC(".maps");
 
+/* Shared Ring Buffer map for emitting sockops registration audit events to userspace TUI */
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 256 * 1024);
+} audit_ringbuf SEC(".maps");
+
 SEC("sockops")
 int sockops_identity_func(struct bpf_sock_ops *skops) {
     /* Only handle IPv4 TCP sockets */
@@ -73,6 +79,26 @@ int sockops_identity_func(struct bpf_sock_ops *skops) {
             stats->pass_packets++; /* successful registration */
         } else {
             stats->drop_packets++; /* registration failed */
+        }
+    }
+
+    if (ret == 0) {
+        /* Emit audit event for sockops registration to TUI ring buffer consumer */
+        struct audit_event *event = bpf_ringbuf_reserve(&audit_ringbuf, sizeof(*event), 0);
+        if (event) {
+            event->timestamp_ns = bpf_ktime_get_ns();
+            event->src_ip       = skops->local_ip4;
+            event->dst_ip       = skops->remote_ip4;
+            event->src_port     = (unsigned short)skops->local_port;
+            event->dst_port     = (unsigned short)bpf_ntohl(skops->remote_port);
+            event->protocol     = 6; /* TCP */
+            event->verdict      = VERDICT_PASS; /* 0 */
+            event->reason_code  = REASON_SOCKOPS_REDIRECT; /* 7 */
+            event->rule_id      = 701;
+            event->cgroup_id    = bpf_get_current_cgroup_id();
+            event->identity_id  = 0;
+            event->pad          = 0;
+            bpf_ringbuf_submit(event, 0);
         }
     }
 
