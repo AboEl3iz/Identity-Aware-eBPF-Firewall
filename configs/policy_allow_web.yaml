@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: FirewallPolicy
+metadata:
+  name: allow-web-policy
+spec:
+  defaultAction: allow
+  rules:
+    - id: 101
+      name: block-untrusted-subnet
+      action: deny
+      srcCIDRs:
+        - "192.168.100.0/24"
+    - id: 102
+      name: allow-web-http
+      action: allow
+      dstPorts:
+        - 80
+        - 8080
+      protocols:
+        - tcp
+    - id: 201
+      name: block-port-9090
+      action: deny
+      dstPorts:
+        - 9090
+      protocols:
+        - tcp
