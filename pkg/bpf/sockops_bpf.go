@@ -32,6 +32,7 @@ type sockopsStatsValue struct {
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
+	sockopsMapAuditRingbuf         = "audit_ringbuf"
 	sockopsMapSockHash             = "sock_hash"
 	sockopsMapSockopsStatsMap      = "sockops_stats_map"
 	sockopsProgSockopsIdentityFunc = "sockops_identity_func"
@@ -86,6 +87,7 @@ type sockopsProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type sockopsMapSpecs struct {
+	AuditRingbuf    *ebpf.MapSpec `ebpf:"audit_ringbuf"`
 	SockHash        *ebpf.MapSpec `ebpf:"sock_hash"`
 	SockopsStatsMap *ebpf.MapSpec `ebpf:"sockops_stats_map"`
 }
@@ -116,12 +118,14 @@ func (o *sockopsObjects) Close() error {
 //
 // It can be passed to loadSockopsObjects or ebpf.CollectionSpec.LoadAndAssign.
 type sockopsMaps struct {
+	AuditRingbuf    *ebpf.Map `ebpf:"audit_ringbuf"`
 	SockHash        *ebpf.Map `ebpf:"sock_hash"`
 	SockopsStatsMap *ebpf.Map `ebpf:"sockops_stats_map"`
 }
 
 func (m *sockopsMaps) Close() error {
 	return _SockopsClose(
+		m.AuditRingbuf,
 		m.SockHash,
 		m.SockopsStatsMap,
 	)

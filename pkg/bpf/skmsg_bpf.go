@@ -32,6 +32,7 @@ type skmsgStatsValue struct {
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
+	skmsgMapAuditRingbuf       = "audit_ringbuf"
 	skmsgMapSockHash           = "sock_hash"
 	skmsgMapSockopsStatsMap    = "sockops_stats_map"
 	skmsgProgProxyRedirectFunc = "proxy_redirect_func"
@@ -86,6 +87,7 @@ type skmsgProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type skmsgMapSpecs struct {
+	AuditRingbuf    *ebpf.MapSpec `ebpf:"audit_ringbuf"`
 	SockHash        *ebpf.MapSpec `ebpf:"sock_hash"`
 	SockopsStatsMap *ebpf.MapSpec `ebpf:"sockops_stats_map"`
 }
@@ -116,12 +118,14 @@ func (o *skmsgObjects) Close() error {
 //
 // It can be passed to loadSkmsgObjects or ebpf.CollectionSpec.LoadAndAssign.
 type skmsgMaps struct {
+	AuditRingbuf    *ebpf.Map `ebpf:"audit_ringbuf"`
 	SockHash        *ebpf.Map `ebpf:"sock_hash"`
 	SockopsStatsMap *ebpf.Map `ebpf:"sockops_stats_map"`
 }
 
 func (m *skmsgMaps) Close() error {
 	return _SkmsgClose(
+		m.AuditRingbuf,
 		m.SockHash,
 		m.SockopsStatsMap,
 	)
