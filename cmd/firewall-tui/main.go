@@ -86,11 +86,13 @@ type model struct {
 	height     int
 	activePane int // 0: Telemetry, 1: Conntrack/Rules, 2: Audit Stream, 3: Inspector
 
-	connected   bool
-	activeGen   uint32
-	stats       control.StatsSummary
-	rxHistory   []uint64
-	dropHistory []uint64
+	connected      bool
+	activeGen      uint32
+	stats          control.StatsSummary
+	sockopsStats   control.StatsSummary
+	sockopsEnabled bool
+	rxHistory      []uint64
+	dropHistory    []uint64
 
 	ctTable     table.Model
 	auditEvents []observability.AuditEvent
@@ -228,6 +230,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.rxHistory = append(m.rxHistory[1:], msg.resp.Stats.RxPackets)
 				m.dropHistory = append(m.dropHistory[1:], msg.resp.Stats.DropPackets)
 			}
+			m.sockopsEnabled = msg.resp.SockopsEnabled
+			if msg.resp.SockopsStats != nil {
+				m.sockopsStats = *msg.resp.SockopsStats
+			}
 
 			// Update Conntrack Table Rows
 			var rows []table.Row
@@ -334,10 +340,17 @@ func (m model) View() string {
 		paneHeaderStyle.Render("[1] REAL-TIME WIRE TELEMETRY"),
 		fmt.Sprintf("%s %s   %s %s", labelStyle.Render("RX PACKETS:"), valueStyle.Render(fmt.Sprintf("%d", m.stats.RxPackets)), labelStyle.Render("RX BYTES:"), valueStyle.Render(fmt.Sprintf("%d B", m.stats.RxBytes))),
 		fmt.Sprintf("%s %s   %s %s", labelStyle.Render("PASS PKTS: "), tagPass.Render(fmt.Sprintf("%d", m.stats.PassPackets)), labelStyle.Render("DROP PKTS:"), tagDrop.Render(fmt.Sprintf("%d", m.stats.DropPackets))),
+	}
+	if m.sockopsEnabled {
+		p1Lines = append(p1Lines,
+			fmt.Sprintf("%s %s   %s %s", labelStyle.Render("SOCKOPS REDIR:"), tagInfo.Render(fmt.Sprintf("%d", m.sockopsStats.PassPackets)), labelStyle.Render("REDIR BYTES:"), valueStyle.Render(fmt.Sprintf("%d B", m.sockopsStats.RxBytes))),
+		)
+	}
+	p1Lines = append(p1Lines,
 		"",
 		fmt.Sprintf("%s [%s] %s", labelStyle.Render("RX RATE:  "), tagPass.Render(renderSparkline(m.rxHistory)), valueStyle.Render(fmt.Sprintf("+%d", rxDelta))),
 		fmt.Sprintf("%s [%s] %s", labelStyle.Render("DROP RATE:"), tagDrop.Render(renderSparkline(m.dropHistory)), valueStyle.Render(fmt.Sprintf("+%d", dropDelta))),
-	}
+	)
 	pane1 := p1Box.Width(paneWidth).Height(topHeight).Render(clampLines(p1Lines, topHeight-1))
 
 	// -------------------------------------------------------------
@@ -362,6 +375,9 @@ func (m model) View() string {
 			fmt.Sprintf(" %s Rule 103: Block Cgroup /test-app-blocked", tagDrop.Render("*")),
 			fmt.Sprintf(" %s Rule 201: Block Port 9090 (TCP)", tagDrop.Render("*")),
 		)
+		if m.sockopsEnabled {
+			p2Lines = append(p2Lines, fmt.Sprintf(" %s Rule 701: Sockops Socket Redirect (Active)", tagInfo.Render("*")))
+		}
 	}
 	pane2 := p2Box.Width(paneWidth).Height(topHeight).Render(clampLines(p2Lines, topHeight-1))
 
@@ -392,6 +408,8 @@ func (m model) View() string {
 			tag := tagPass.Render("[PASS]")
 			if e.Verdict == 1 {
 				tag = tagDrop.Render("[DROP]")
+			} else if e.Verdict == 2 {
+				tag = tagInfo.Render("[REDIRECT]")
 			}
 			line := fmt.Sprintf("%s %s %s -> %s:%d (%s)", e.TimestampFormatted(), tag, e.FormattedSrcIP(), e.FormattedDstIP(), e.DstPort, e.ReasonString())
 			if i == m.selectedIdx {
@@ -418,6 +436,8 @@ func (m model) View() string {
 		verdictFormatted := tagPass.Render("PASS (0)")
 		if e.Verdict == 1 {
 			verdictFormatted = tagDrop.Render("DROP (1)")
+		} else if e.Verdict == 2 {
+			verdictFormatted = tagInfo.Render("REDIRECT (2)")
 		}
 
 		p4Lines = append(p4Lines,
