@@ -20,6 +20,7 @@ High-performance, in-kernel **Identity-Aware eBPF Firewall** engine featuring st
    - [Feature 4: Policy DSL, Compiler & Double-Buffered Zero-Drop Atomic Swap](#feature-4-policy-dsl-compiler--double-buffered-zero-drop-atomic-swap)
    - [Feature 5: Real-Time Observability Engine & Interactive Bubbletea TUI](#feature-5-real-time-observability-engine--interactive-bubbletea-tui)
    - [Feature 6: Security Hardening, Capability Separation & Socket RBAC](#feature-6-security-hardening-capability-separation--socket-rbac)
+   - [Feature 7: Sockops / Sk_msg Direct Socket Redirection](#feature-7-sockops--sk_msg-direct-socket-redirection)
 5. [System Architecture](#5-system-architecture)
 6. [Directory Structure & Project File Links](#6-directory-structure--project-file-links)
 7. [Getting Started & Operator Guide](#7-getting-started--operator-guide)
@@ -66,6 +67,7 @@ This project delivers a multi-layered security engine implemented entirely in **
 | **Atomic Reload** | Control Plane | Generation Array Map | Double-buffered 1-op switch in [atomic_swap.go](pkg/compiler/atomic_swap.go) |
 | **Observability TUI** | Monitoring Engine | `BPF_MAP_TYPE_RINGBUF` | 4-Pane HUD in [main.go](cmd/firewall-tui/main.go) |
 | **Security Hardening** | Privilege Separation | `capset` / `SO_PEERCRED` | Capability bounding in [caps.go](pkg/security/caps.go) & RBAC in [rbac.go](pkg/security/rbac.go) |
+| **Sockops Direct Redirect** | Socket Bypass | `SEC("sockops")` & `SEC("sk_msg")` | `BPF_MAP_TYPE_SOCKHASH` pin-sharing in [sockops_identity.c](bpf/sockops_identity.c) & [proxy_redirect.c](bpf/proxy_redirect.c) |
 
 ---
 
@@ -161,6 +163,20 @@ This project delivers a multi-layered security engine implemented entirely in **
 
 ---
 
+### Feature 7: Sockops / Sk_msg Direct Socket Redirection
+- **Goal**: Bypass the full Linux TCP/IP network stack (XDP, TC, IP routing, device drivers) for co-located TCP workloads by flowing payloads directly from socket write buffers to peer socket read buffers.
+- **Implementation**:
+  - Sockops C Program: [sockops_identity.c](bpf/sockops_identity.c) attached to `SEC("sockops")`.
+  - Sk_msg C Program: [proxy_redirect.c](bpf/proxy_redirect.c) attached to `SEC("sk_msg")`.
+  - Shared Map: `sock_hash` (`BPF_MAP_TYPE_SOCKHASH`) pinned to `/sys/fs/bpf/sock_hash` and shared across loaded BPF objects via `ebpf.CollectionOptions{MapReplacements: ...}`.
+  - Loader & IPC Integration: [loader.go](pkg/bpf/loader.go), [main.go](cmd/firewall-agent/main.go), [server.go](pkg/control/server.go), and [main.go](cmd/firewall-ctl/main.go).
+- **Workflow**:
+  1. TCP Handshake Callback: `sockops_identity_func` intercepts `BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB` and `BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB`, extracts 4-tuple key (`sip`, `dip`, `sport`, `dport`), and registers active sockets into `sock_hash`.
+  2. Data Redirection: When a socket writes data (`sendmsg`/`write`), `proxy_redirect_func` constructs the peer lookup key and executes `bpf_msg_redirect_hash(msg, &sock_hash, &peer_key, BPF_F_INGRESS)`.
+  3. Zero-Copy Delivery: Payloads pass directly to the target socket's receive buffer. Non-local traffic safely falls through to normal TCP stack processing (`SK_PASS`).
+
+---
+
 ## 5. System Architecture
 
 ```mermaid
@@ -214,7 +230,9 @@ Below is the directory hierarchy with direct relative repository links:
 - **Kernel eBPF Programs (`bpf/`)**:
   - [xdp_firewall.c](bpf/xdp_firewall.c) — XDP L3/L4 Volumetric Dropper & Cgroup Identity Filter.
   - [tc_firewall.c](bpf/tc_firewall.c) — TC Stateful Conntrack Classifier & TCP State Machine.
-  - [headers/common.h](bpf/headers/common.h) — Verdicts, reason codes, 5-tuple keys, `audit_event` struct.
+  - [sockops_identity.c](bpf/sockops_identity.c) — Sockops Socket Registration (`SEC("sockops")`).
+  - [proxy_redirect.c](bpf/proxy_redirect.c) — Sk_msg Direct Socket Redirection (`SEC("sk_msg")`).
+  - [headers/common.h](bpf/headers/common.h) — Verdicts, reason codes, 5-tuple keys, `struct sock_key`, `audit_event` struct.
   - [headers/maps.h](bpf/headers/maps.h) — BTF map helper definitions.
   - [headers/state_machine.h](bpf/headers/state_machine.h) — TCP state constants and flag checkers.
   - [headers/bpf_endian.h](bpf/headers/bpf_endian.h) — Byte order conversion macros.
@@ -226,7 +244,7 @@ Below is the directory hierarchy with direct relative repository links:
   - [pktgen/main.go](cmd/pktgen/main.go) — Raw socket packet generator & test injector.
 
 - **Go Subsystems (`pkg/`)**:
-  - [pkg/bpf/loader.go](pkg/bpf/loader.go) — Program attachment, link management, map updates.
+  - [pkg/bpf/loader.go](pkg/bpf/loader.go) — Program attachment, link management, map updates, sockops pin-sharing.
   - [pkg/compiler/dsl.go](pkg/compiler/dsl.go) — YAML policy AST structure definitions.
   - [pkg/compiler/compiler.go](pkg/compiler/compiler.go) — Policy AST validation & map key compilation.
   - [pkg/compiler/atomic_swap.go](pkg/compiler/atomic_swap.go) — Generation-indexed double-buffer `MapSwapper`.
@@ -245,6 +263,7 @@ Below is the directory hierarchy with direct relative repository links:
   - [test/e2e/phase4_test.go](test/e2e/phase4_test.go) — Phase 4 Zero-Drop Atomic Reload E2E test.
   - [test/e2e/phase5_test.go](test/e2e/phase5_test.go) — Phase 5 AuditStore & Filtering E2E test.
   - [test/e2e/phase6_test.go](test/e2e/phase6_test.go) — Phase 6 Security & RBAC E2E test.
+  - [test/e2e/phase7_test.go](test/e2e/phase7_test.go) — Phase 7 Sockops / Sk_msg Direct Socket Redirection E2E test.
   - [Makefile](Makefile) — Build, test, netns & debug automation.
   - [project_plan.md](project_plan.md) — Phased production execution plan & milestones.
   - [journal.md](journal.md) — Cumulative technical engineering journal.
@@ -326,6 +345,9 @@ make tui
 Execute unit tests and E2E netns integration test suites across all phases:
 
 ```bash
+# Run Phase 7 Sockops Direct Socket Redirection Test Suite
+make test-phase7
+
 # Run Phase 6 Capability & RBAC Test Suite
 make test-phase6
 
