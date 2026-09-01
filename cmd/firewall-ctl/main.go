@@ -84,6 +84,15 @@ func main() {
 				fmt.Printf("PASS Packets:      %d\n", resp.Stats.PassPackets)
 				fmt.Printf("DROP Packets:      %d\n", resp.Stats.DropPackets)
 			}
+			if resp.SockopsEnabled {
+				fmt.Println("\n--- Sockops Direct Redirect ---")
+				if resp.SockopsStats != nil {
+					fmt.Printf("  Sockops Events:    %d\n", resp.SockopsStats.RxPackets)
+					fmt.Printf("  Redirected:        %d\n", resp.SockopsStats.PassPackets)
+					fmt.Printf("  Redirect Bytes:    %d\n", resp.SockopsStats.RxBytes)
+					fmt.Printf("  Redirect Failures: %d\n", resp.SockopsStats.DropPackets)
+				}
+			}
 
 		default:
 			printUsage()
