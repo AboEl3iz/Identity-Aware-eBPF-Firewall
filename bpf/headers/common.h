@@ -98,4 +98,18 @@ struct stats_value {
     __u64 drop_packets;
 };
 
+/* Socket 4-tuple key for SOCKHASH map (used by sockops + sk_msg).
+ * Ports are __u32 to match bpf_sock_ops->local_port / remote_port widths.
+ * Using __u16 would introduce padding mismatches between sockops and sk_msg
+ * key construction, silently breaking SOCKHASH lookups. */
+struct sock_key {
+    __u32 sip;    /* Source IPv4 address (network byte order) */
+    __u32 dip;    /* Destination IPv4 address (network byte order) */
+    __u32 sport;  /* Source port (host byte order) */
+    __u32 dport;  /* Destination port (host byte order) */
+};
+
+/* Reason code for sockops redirect events */
+#define REASON_SOCKOPS_REDIRECT  7
+
 #endif /* __COMMON_H__ */
