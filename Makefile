@@ -1,5 +1,5 @@
 # eBPF Firewall Engineering Makefile
-.PHONY: all deps build-bpf build netns-up netns-down cgroup-setup cgroup-down run-agent test-phase1 test-phase2 test-phase3 dump-maps monitor clean
+.PHONY: all deps build-bpf build netns-up netns-down cgroup-setup cgroup-down run-agent test-phase1 test-phase2 test-phase3 test-phase4 test-phase5 test-phase6 test-phase7 tui ctl-status ctl-apply ctl-dump dump-maps monitor clean
 
 CLANG ?= clang
 CFLAGS ?= -O2 -g -Wall -target bpf -D__TARGET_ARCH_x86
@@ -9,6 +9,8 @@ GO ?= go
 CLIENT_NS = client
 SERVER_NS = server
 IFACE = veth-s
+SOCKET ?= /var/run/firewall-agent.sock
+POLICY ?= configs/policy.example.yaml
 
 all: build-bpf build
 
@@ -27,7 +29,7 @@ build-bpf:
 
 
 ## 3. Go Binary Build
-build:
+build: build-bpf
 	@echo "==> Building Go control plane binaries..."
 	mkdir -p bin
 	$(GO) build -o bin/firewall-agent ./cmd/firewall-agent
@@ -52,7 +54,7 @@ cgroup-down:
 ## 5. Execution & Phase Integration Testing
 run-agent:
 	@echo "==> Running firewall agent in server netns attached to $(IFACE)..."
-	sudo ip netns exec $(SERVER_NS) ./bin/firewall-agent --iface $(IFACE) --config configs/policy.example.yaml
+	sudo ip netns exec $(SERVER_NS) ./bin/firewall-agent --iface $(IFACE) --config configs/policy.example.yaml --socket $(SOCKET)
 
 test-phase1: netns-up
 	@echo "==> Executing Phase 1 Stateless XDP Drop Test..."
@@ -74,7 +76,42 @@ test-phase3: netns-up cgroup-setup
 	@echo "==> Executing Phase 3 Cgroup Identity Resolution Test..."
 	sudo $(GO) test -v ./test/e2e -run TestCgroupIdentity
 
-## 6. Inspection & Debugging Tools
+test-phase4: build
+	@echo "==> Executing Phase 4 Control Plane, Policy DSL & Atomic Reload Test..."
+	sudo $(GO) test -v ./test/e2e -run TestPhase4AtomicPolicyReload
+
+test-phase5: build
+	@echo "==> Executing Phase 5 Observability Engine & AuditStore Test..."
+	$(GO) test -v ./test/e2e -run "TestAuditStore|TestAuditEvent"
+
+test-phase6: build
+	@echo "==> Executing Phase 6 Security Hardening, Privilege Separation & RBAC Test..."
+	$(GO) test -v ./pkg/security/...
+	sudo $(GO) test -v ./test/e2e -run TestPhase6SecurityRBAC
+
+test-phase7: build
+	@echo "==> Executing Phase 7 Sockops Direct Socket Redirection Test..."
+	sudo $(GO) test -v ./test/e2e -run TestSockopsDirectRedirect -timeout 60s
+
+
+## 6. Control Plane CLI & Inspection Tools
+tui: build
+	@echo "==> Launching firewall-tui Observability Dashboard..."
+	./bin/firewall-tui --socket $(SOCKET)
+
+ctl-status:
+	@echo "==> Querying Firewall Agent Status via firewall-ctl..."
+	./bin/firewall-ctl policy status --socket $(SOCKET)
+
+ctl-apply:
+	@echo "==> Applying Policy '$(POLICY)' via firewall-ctl..."
+	./bin/firewall-ctl policy apply -f $(POLICY) --socket $(SOCKET)
+
+ctl-dump:
+	@echo "==> Dumping BPF Map State via firewall-ctl..."
+	./bin/firewall-ctl map dump --socket $(SOCKET)
+
+
 dump-maps:
 	@echo "==> Dumping active eBPF maps..."
 	sudo bpftool map dump name xdp_stats_map || true
@@ -89,5 +126,7 @@ monitor:
 clean: netns-down cgroup-down
 	@echo "==> Cleaning build artifacts..."
 	rm -rf bin/
-	rm -f pkg/bpf/xdp_bpf* pkg/bpf/tc_bpf*
+	rm -f pkg/bpf/xdp_bpf* pkg/bpf/tc_bpf* pkg/bpf/sockops_bpf* pkg/bpf/skmsg_bpf*
+	rm -f /sys/fs/bpf/sock_hash
 	@echo "==> Clean complete."
+
