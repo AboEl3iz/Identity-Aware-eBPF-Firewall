@@ -30,6 +30,8 @@ type Response struct {
 	CallerPID        int32                      `json:"caller_pid,omitempty"`
 	CallerRole       security.Role              `json:"caller_role,omitempty"`
 	Stats            *StatsSummary              `json:"stats,omitempty"`
+	SockopsStats     *StatsSummary              `json:"sockops_stats,omitempty"`
+	SockopsEnabled   bool                       `json:"sockops_enabled"`
 	Conntrack        []ConntrackFlowSummary     `json:"conntrack,omitempty"`
 	AuditEvents      []observability.AuditEvent `json:"audit_events,omitempty"`
 	Dump             *MapDumpSummary            `json:"dump,omitempty"`
@@ -221,6 +223,8 @@ func (s *ControlServer) processRequest(req Request) Response {
 	case "get_status":
 		var gen uint32
 		var stats *StatsSummary
+		var sockopsStats *StatsSummary
+		var sockopsEnabled bool
 		var ctSummaries []ConntrackFlowSummary
 
 		if s.loader != nil {
@@ -236,6 +240,17 @@ func (s *ControlServer) processRequest(req Request) Response {
 					RxBytes:     st.RxBytes,
 					PassPackets: st.PassPackets,
 					DropPackets: st.DropPackets,
+				}
+			}
+
+			// Sockops / Sk_msg redirect stats
+			sockopsEnabled = s.loader.IsSockopsEnabled()
+			if soStats, err := s.loader.GetSockopsStats(); err == nil && soStats != nil {
+				sockopsStats = &StatsSummary{
+					RxPackets:   soStats.RxPackets,
+					RxBytes:     soStats.RxBytes,
+					PassPackets: soStats.PassPackets,
+					DropPackets: soStats.DropPackets,
 				}
 			}
 
@@ -274,6 +289,8 @@ func (s *ControlServer) processRequest(req Request) Response {
 			Success:          true,
 			ActiveGeneration: gen,
 			Stats:            stats,
+			SockopsStats:     sockopsStats,
+			SockopsEnabled:   sockopsEnabled,
 			Conntrack:        ctSummaries,
 			AuditEvents:      auditEvts,
 		}
