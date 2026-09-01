@@ -59,6 +59,8 @@ func (e *AuditEvent) ReasonString() string {
 		return "UNTRACKED_NON_SYN"
 	case 6:
 		return "DEFAULT_DROP"
+	case 7:
+		return "SOCKOPS_REDIRECT"
 	default:
 		return fmt.Sprintf("REASON_%d", e.ReasonCode)
 	}
