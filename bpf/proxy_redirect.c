@@ -28,6 +28,12 @@ struct {
     __type(value, struct stats_value);
 } sockops_stats_map SEC(".maps");
 
+/* Shared Ring Buffer map for emitting redirect audit events to userspace TUI */
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 256 * 1024);
+} audit_ringbuf SEC(".maps");
+
 SEC("sk_msg")
 int proxy_redirect_func(struct sk_msg_md *msg) {
     /*
@@ -68,6 +74,26 @@ int proxy_redirect_func(struct sk_msg_md *msg) {
             stats->pass_packets++;   /* redirect succeeded */
         } else {
             stats->drop_packets++;   /* redirect failed, will fall through */
+        }
+    }
+
+    if (ret == SK_PASS) {
+        /* Emit audit event over ring buffer for TUI observability */
+        struct audit_event *event = bpf_ringbuf_reserve(&audit_ringbuf, sizeof(*event), 0);
+        if (event) {
+            event->timestamp_ns = bpf_ktime_get_ns();
+            event->src_ip       = msg->local_ip4;
+            event->dst_ip       = msg->remote_ip4;
+            event->src_port     = (unsigned short)msg->local_port;
+            event->dst_port     = (unsigned short)msg->remote_port;
+            event->protocol     = 6; /* TCP */
+            event->verdict      = VERDICT_REDIRECT; /* 2 */
+            event->reason_code  = REASON_SOCKOPS_REDIRECT; /* 7 */
+            event->rule_id      = 701;
+            event->cgroup_id    = bpf_get_current_cgroup_id();
+            event->identity_id  = 0;
+            event->pad          = 0;
+            bpf_ringbuf_submit(event, 0);
         }
     }
 
