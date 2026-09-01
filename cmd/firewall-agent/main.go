@@ -23,6 +23,8 @@ func main() {
 	socketPath := flag.String("socket", "/var/run/firewall-agent.sock", "Path to Unix domain socket for IPC control plane")
 	blockCIDR := flag.String("block-cidr", "", "Optional CIDR block rule (e.g. 10.0.0.1/32)")
 	blockCgroup := flag.String("block-cgroup", "", "Optional cgroup path block rule (e.g. /sys/fs/cgroup/test-app-blocked)")
+	enableSockops := flag.Bool("enable-sockops", false, "Enable sockops/sk_msg direct socket redirection for co-located workloads")
+	sockopsCgroup := flag.String("sockops-cgroup", "/sys/fs/cgroup", "Cgroup v2 path for sockops attachment scope")
 	flag.Parse()
 
 	log.Printf("[+] Starting eBPF Firewall Agent on interface '%s'...", *iface)
@@ -40,7 +42,18 @@ func main() {
 	}
 	defer loader.Close()
 
-	log.Printf("[+] XDP & TC programs successfully attached to interface '%s'.", *iface)
+	log.Printf("[+] XDP & TC programs successfully attached to interface '%s'.\n", *iface)
+
+	// Phase 7: Sockops/Sk_msg Direct Socket Redirection
+	if *enableSockops {
+		log.Printf("[+] Enabling sockops/sk_msg direct socket redirection (cgroup: %s)...", *sockopsCgroup)
+		if err := loader.LoadSockops(*sockopsCgroup); err != nil {
+			log.Printf("[!] Warning: Failed to enable sockops redirection: %v", err)
+			log.Printf("[!] Continuing without direct socket redirection (XDP+TC remain active).")
+		} else {
+			log.Printf("[+] Sockops + sk_msg programs attached. Co-located TCP sockets will bypass network stack.")
+		}
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -129,6 +142,12 @@ func main() {
 						log.Printf("[CONNTRACK] Flow %s:%d -> %s:%d (Proto %d) State: %s Packets: %d Bytes: %d",
 							flow.SrcIP, flow.SrcPort, flow.DstIP, flow.DstPort, flow.Protocol, flow.State, flow.Packets, flow.Bytes)
 					}
+				}
+
+				// Report sockops redirect stats
+				if sockopsStats, err := loader.GetSockopsStats(); err == nil && sockopsStats != nil && sockopsStats.RxPackets > 0 {
+					log.Printf("[SOCKOPS] Events: %d | Redirected: %d | Bytes: %d | Failed: %d",
+						sockopsStats.RxPackets, sockopsStats.PassPackets, sockopsStats.RxBytes, sockopsStats.DropPackets)
 				}
 			}
 		}
