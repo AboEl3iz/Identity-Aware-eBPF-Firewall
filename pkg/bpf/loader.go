@@ -491,8 +491,12 @@ func (l *FirewallLoader) LoadSockops(cgroupPath string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	// 1. Load sockops objects (creates sock_hash and sockops_stats_map)
-	if err := loadSockopsObjects(&l.sockopsObjs, nil); err != nil {
+	// 1. Load sockops objects (creates sock_hash and sockops_stats_map, sharing audit_ringbuf)
+	if err := loadSockopsObjects(&l.sockopsObjs, &ebpf.CollectionOptions{
+		MapReplacements: map[string]*ebpf.Map{
+			"audit_ringbuf": l.objs.AuditRingbuf,
+		},
+	}); err != nil {
 		return fmt.Errorf("failed to load sockops objects: %w", err)
 	}
 
@@ -511,6 +515,7 @@ func (l *FirewallLoader) LoadSockops(cgroupPath string) error {
 		MapReplacements: map[string]*ebpf.Map{
 			"sock_hash":         l.sockopsObjs.SockHash,
 			"sockops_stats_map": l.sockopsObjs.SockopsStatsMap,
+			"audit_ringbuf":     l.objs.AuditRingbuf,
 		},
 	}); err != nil {
 		l.sockopsObjs.Close()
