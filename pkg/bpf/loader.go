@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
@@ -19,17 +20,22 @@ import (
 	"policy_engine/pkg/observability"
 )
 
-// FirewallLoader manages loaded eBPF programs (XDP + TC), link attachments, and map operations.
+// FirewallLoader manages loaded eBPF programs (XDP + TC + Sockops + Sk_msg), link attachments, and map operations.
 type FirewallLoader struct {
-	ifaceName      string
-	iface          *net.Interface
-	objs           xdpObjects
-	tcObjs         tcObjects
-	xdpLink        link.Link
-	tcPinPath      string
-	ringReader     *ringbuf.Reader
-	cgroupResolver *identity.CgroupResolver
-	mu             sync.RWMutex
+	ifaceName       string
+	iface           *net.Interface
+	objs            xdpObjects
+	tcObjs          tcObjects
+	sockopsObjs     sockopsObjects
+	skmsgObjs       skmsgObjects
+	xdpLink         link.Link
+	sockopsLink     link.Link
+	tcPinPath       string
+	sockHashPinPath string
+	ringReader      *ringbuf.Reader
+	cgroupResolver  *identity.CgroupResolver
+	sockopsEnabled  bool
+	mu              sync.RWMutex
 }
 
 // NewFirewallLoader initializes environment memory limits, loads eBPF objects, and attaches XDP & TC programs.
@@ -479,7 +485,103 @@ func (l *FirewallLoader) ReadRingbuf(ctx context.Context, handler func(observabi
 	}
 }
 
-// Close detaches XDP & TC links, closes ringbuf reader, and unloads BPF objects.
+// LoadSockops loads sockops and sk_msg BPF programs, pins the shared sock_hash map,
+// and attaches sockops to a cgroup v2 path and sk_msg to the sock_hash map.
+func (l *FirewallLoader) LoadSockops(cgroupPath string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// 1. Load sockops objects (creates sock_hash and sockops_stats_map)
+	if err := loadSockopsObjects(&l.sockopsObjs, nil); err != nil {
+		return fmt.Errorf("failed to load sockops objects: %w", err)
+	}
+
+	// 2. Pin sock_hash map to BPF filesystem for sharing with sk_msg program
+	l.sockHashPinPath = "/sys/fs/bpf/sock_hash"
+	os.Remove(l.sockHashPinPath)
+	if err := l.sockopsObjs.SockHash.Pin(l.sockHashPinPath); err != nil {
+		l.sockopsObjs.Close()
+		return fmt.Errorf("failed to pin sock_hash map to %s: %w", l.sockHashPinPath, err)
+	}
+
+	// 3. Load sk_msg objects, reusing the pinned sock_hash and sockops_stats_map
+	//    This ensures both programs operate on the SAME kernel map instances.
+	//    Without this, each object gets its own private map and redirect silently fails.
+	if err := loadSkmsgObjects(&l.skmsgObjs, &ebpf.CollectionOptions{
+		MapReplacements: map[string]*ebpf.Map{
+			"sock_hash":         l.sockopsObjs.SockHash,
+			"sockops_stats_map": l.sockopsObjs.SockopsStatsMap,
+		},
+	}); err != nil {
+		l.sockopsObjs.Close()
+		os.Remove(l.sockHashPinPath)
+		return fmt.Errorf("failed to load skmsg objects with shared maps: %w", err)
+	}
+
+	// 4. Attach sockops program to cgroup v2 path
+	sockopsLink, err := link.AttachCgroup(link.CgroupOptions{
+		Path:    cgroupPath,
+		Program: l.sockopsObjs.SockopsIdentityFunc,
+		Attach:  ebpf.AttachCGroupSockOps,
+	})
+	if err != nil {
+		l.skmsgObjs.Close()
+		l.sockopsObjs.Close()
+		os.Remove(l.sockHashPinPath)
+		return fmt.Errorf("failed to attach sockops to cgroup %s: %w", cgroupPath, err)
+	}
+	l.sockopsLink = sockopsLink
+
+	// 5. Attach sk_msg program to sock_hash map.
+	//    Unlike XDP/TC which attach to interfaces, sk_msg attaches to the SOCKHASH map itself.
+	//    Every socket write hitting a socket registered in sock_hash triggers the sk_msg program.
+	if err := link.RawAttachProgram(link.RawAttachProgramOptions{
+		Target:  l.sockopsObjs.SockHash.FD(),
+		Program: l.skmsgObjs.ProxyRedirectFunc,
+		Attach:  ebpf.AttachSkMsgVerdict,
+	}); err != nil {
+		sockopsLink.Close()
+		l.skmsgObjs.Close()
+		l.sockopsObjs.Close()
+		os.Remove(l.sockHashPinPath)
+		return fmt.Errorf("failed to attach sk_msg to sock_hash: %w", err)
+	}
+
+	l.sockopsEnabled = true
+	return nil
+}
+
+// IsSockopsEnabled returns whether sockops/sk_msg direct socket redirection is active.
+func (l *FirewallLoader) IsSockopsEnabled() bool {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.sockopsEnabled
+}
+
+// GetSockopsStats queries and aggregates per-CPU sockops redirect statistics.
+func (l *FirewallLoader) GetSockopsStats() (*Stats, error) {
+	if !l.sockopsEnabled {
+		return nil, nil
+	}
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	var total Stats
+	var perCPU []sockopsStatsValue
+	var key uint32 = 0
+
+	if err := l.sockopsObjs.SockopsStatsMap.Lookup(&key, &perCPU); err == nil {
+		for _, cpuStats := range perCPU {
+			total.RxPackets += cpuStats.RxPackets
+			total.RxBytes += cpuStats.RxBytes
+			total.PassPackets += cpuStats.PassPackets
+			total.DropPackets += cpuStats.DropPackets
+		}
+	}
+	return &total, nil
+}
+
+// Close detaches XDP, TC, Sockops & Sk_msg links, closes ringbuf reader, and unloads BPF objects.
 func (l *FirewallLoader) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -495,6 +597,26 @@ func (l *FirewallLoader) Close() error {
 	if l.tcPinPath != "" {
 		os.Remove(l.tcPinPath)
 	}
+
+	// Sockops / Sk_msg cleanup
+	if l.sockopsEnabled {
+		// Detach sk_msg from sock_hash map
+		if l.sockopsObjs.SockHash != nil && l.skmsgObjs.ProxyRedirectFunc != nil {
+			_ = link.RawDetachProgram(link.RawDetachProgramOptions{
+				Target:  l.sockopsObjs.SockHash.FD(),
+				Program: l.skmsgObjs.ProxyRedirectFunc,
+				Attach:  ebpf.AttachSkMsgVerdict,
+			})
+		}
+	}
+	if l.sockopsLink != nil {
+		l.sockopsLink.Close()
+	}
+	if l.sockHashPinPath != "" {
+		os.Remove(l.sockHashPinPath)
+	}
+	l.skmsgObjs.Close()
+	l.sockopsObjs.Close()
 
 	l.tcObjs.Close()
 	return l.objs.Close()
